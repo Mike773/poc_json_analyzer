@@ -17,6 +17,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 from src.schema import open_session_db
 from src.ingest import load_json
 from src.peers import build_peer_groups
@@ -68,12 +72,20 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="печатать вызовы тулов")
     parser.add_argument("--question", "-q", type=str, help="одиночный вопрос (без интерактива)")
     parser.add_argument(
+        "--provider",
+        default=os.environ.get("LLM_PROVIDER", "openai"),
+        choices=["openai", "gigachat"],
+        help="провайдер LLM (по умолчанию из LLM_PROVIDER или openai)",
+    )
+    parser.add_argument(
         "--effort",
         default="none",
         choices=["none", "low", "medium", "high"],
-        help="reasoning_effort для o-series; 'none' — не передавать параметр (для не-reasoning моделей)",
+        help="reasoning_effort для reasoning-моделей OpenAI; 'none' — не передавать (GigaChat игнорирует)",
     )
-    parser.add_argument("--model", default="o4-mini")
+    parser.add_argument(
+        "--model", default=None, help="имя модели (по умолчанию — дефолтная модель провайдера)"
+    )
     mem_group = parser.add_mutually_exclusive_group()
     mem_group.add_argument(
         "--memory",
@@ -95,13 +107,14 @@ def main():
     agent = Agent(
         conn,
         model=args.model,
+        provider=args.provider,
         reasoning_effort=effort,
         verbose=args.verbose,
         enable_memory=args.enable_memory,
     )
     print(
-        f"Готово. Модель: {args.model}, reasoning_effort: {effort or '—'}, "
-        f"память: {'on' if args.enable_memory else 'off'}.\n"
+        f"Готово. Провайдер: {agent.provider}, модель: {agent.model}, "
+        f"reasoning_effort: {effort or '—'}, память: {'on' if args.enable_memory else 'off'}.\n"
     )
 
     if args.question:

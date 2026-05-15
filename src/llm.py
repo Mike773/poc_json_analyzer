@@ -1,32 +1,48 @@
-"""LLM-слой: агент-оркестратор и нарратор инсайтов через OpenAI o4-mini."""
+"""LLM-слой: агент-оркестратор и нарратор инсайтов через LangChain.
+
+Провайдер (openai | gigachat) и модель выбираются в src/providers.py.
+"""
 from __future__ import annotations
 
+import copy
 import json
-import os
 import sqlite3
 import time
-from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from . import tools as analytical_tools
 from .humanize import Humanizer
 from .insights import Insight
-
-
-DEFAULT_MODEL = "o4-mini"
+from .providers import get_provider, make_chat_model, resolve_model
 
 
 def _jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-def _ensure_api_key() -> None:
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY не задан. Установите: export OPENAI_API_KEY=sk-..."
-        )
+def _text(content: Any) -> str:
+    """Нормализует content сообщения LangChain (str или список блоков) в строку."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content)
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +357,36 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
+def _tools_for_provider(provider: str) -> List[Dict[str, Any]]:
+    """TOOL_SCHEMAS, адаптированные под function-calling конкретного провайдера.
+
+    GigaChat не принимает JSON-Schema объединения типов (["string","null"]) и
+    enum со значением null. Нормализуем: берём непустой тип, выкидываем null из
+    enum. Опциональность параметра и так выражена его отсутствием в required.
+    OpenAI работает с исходными схемами как есть.
+    """
+    if provider != "gigachat":
+        return TOOL_SCHEMAS
+
+    def _fix(spec: Dict[str, Any]) -> None:
+        t = spec.get("type")
+        if isinstance(t, list):
+            non_null = [x for x in t if x != "null"]
+            spec["type"] = non_null[0] if non_null else "string"
+        enum = spec.get("enum")
+        if isinstance(enum, list):
+            spec["enum"] = [e for e in enum if e is not None]
+        items = spec.get("items")
+        if isinstance(items, dict):
+            _fix(items)
+
+    schemas = copy.deepcopy(TOOL_SCHEMAS)
+    for tool in schemas:
+        for spec in tool["function"]["parameters"].get("properties", {}).values():
+            _fix(spec)
+    return schemas
+
+
 # ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
@@ -578,28 +624,35 @@ class Agent:
     def __init__(
         self,
         conn: sqlite3.Connection,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         max_iterations: int = 12,
         verbose: bool = False,
         enable_memory: bool = True,
+        provider: Optional[str] = None,
     ):
-        """reasoning_effort: 'low' | 'medium' | 'high' | None.
-        None — параметр не передаётся в API (работает с не-reasoning моделями).
+        """provider: 'openai' | 'gigachat' | None (None → берётся из LLM_PROVIDER).
+        model: None → дефолтная модель провайдера.
+
+        reasoning_effort: 'low' | 'medium' | 'high' | None. Применяется только к
+        reasoning-моделям OpenAI; для GigaChat игнорируется.
 
         enable_memory: если False, каждый ask() работает изолированно (без истории пар user/assistant).
         """
-        _ensure_api_key()
         self.conn = conn
-        self.model = model
+        self.provider = provider or get_provider()
+        self.model = resolve_model(model, self.provider)
         self.reasoning_effort = reasoning_effort
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.enable_memory = enable_memory
-        self.client = OpenAI()
+        chat = make_chat_model(
+            self.model, provider=self.provider, reasoning_effort=reasoning_effort
+        )
+        self.llm = chat.bind_tools(_tools_for_provider(self.provider))
         self.system_prompt = build_system_prompt(conn)
-        # История диалога: только пары user/assistant (без tool_calls / tool results).
-        self.history: List[Dict[str, Any]] = []
+        # История диалога: только пары user/assistant (без tool-вызовов и результатов).
+        self.history: List[BaseMessage] = []
         self.humanizer = Humanizer(conn)
 
     def reset_history(self) -> None:
@@ -628,16 +681,13 @@ class Agent:
 
     def ask(self, question: str) -> str:
         if self.enable_memory:
-            messages: List[Dict[str, Any]] = (
-                [{"role": "system", "content": self.system_prompt}]
-                + self.history
-                + [{"role": "user", "content": question}]
+            messages: List[BaseMessage] = (
+                [SystemMessage(self.system_prompt)]
+                + list(self.history)
+                + [HumanMessage(question)]
             )
         else:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": question},
-            ]
+            messages = [SystemMessage(self.system_prompt), HumanMessage(question)]
 
         t_total_start = time.perf_counter()
         t_llm_total = 0.0
@@ -654,60 +704,41 @@ class Agent:
 
         for iteration in range(self.max_iterations):
             step = iteration + 1
-            kwargs: Dict[str, Any] = {
-                "model": self.model,
-                "messages": messages,
-                "tools": TOOL_SCHEMAS,
-            }
-            if self.reasoning_effort:
-                kwargs["reasoning_effort"] = self.reasoning_effort
-
             self._trace(
-                f"├─ [#{step}] LLM call → model={self.model}"
+                f"├─ [#{step}] LLM call → provider={self.provider}, model={self.model}"
                 f"{', effort=' + self.reasoning_effort if self.reasoning_effort else ''}"
             )
             t_llm = time.perf_counter()
-            response = self.client.chat.completions.create(**kwargs)
+            ai_msg: AIMessage = self.llm.invoke(messages)
             dt_llm = time.perf_counter() - t_llm
             t_llm_total += dt_llm
-            msg = response.choices[0].message
 
-            usage = response.usage
+            usage = ai_msg.usage_metadata
             if usage:
-                tokens_prompt_total += usage.prompt_tokens
-                tokens_completion_total += usage.completion_tokens
+                tokens_prompt_total += usage.get("input_tokens", 0) or 0
+                tokens_completion_total += usage.get("output_tokens", 0) or 0
                 self._trace(
-                    f"│  ⏱ {self._fmt_time(dt_llm)} | tokens: prompt={usage.prompt_tokens}, "
-                    f"completion={usage.completion_tokens}, total={usage.total_tokens}"
+                    f"│  ⏱ {self._fmt_time(dt_llm)} | tokens: prompt={usage.get('input_tokens')}, "
+                    f"completion={usage.get('output_tokens')}, total={usage.get('total_tokens')}"
                 )
             else:
                 self._trace(f"│  ⏱ {self._fmt_time(dt_llm)}")
 
+            messages.append(ai_msg)
+
             # Промежуточный текст ассистента — печатаем только если впереди есть tool-вызовы,
             # иначе финальный текст продублируется (вызывающий код печатает ответ сам).
-            if msg.tool_calls and msg.content and msg.content.strip():
-                self._trace(f"│  💭 {msg.content.strip()}")
-
-            # Append assistant turn — preserve tool_calls structure
-            assistant_dict: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if msg.tool_calls:
-                assistant_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in msg.tool_calls
-                ]
-            messages.append(assistant_dict)
+            text = _text(ai_msg.content)
+            if ai_msg.tool_calls and text.strip():
+                self._trace(f"│  💭 {text.strip()}")
 
             # Done?
-            if not msg.tool_calls:
-                final_text = msg.content or ""
-                # Сохраняем ТОЛЬКО пару user/assistant в историю — без tool_calls и tool results.
+            if not ai_msg.tool_calls:
+                final_text = text
+                # Сохраняем ТОЛЬКО пару user/assistant в историю — без tool-вызовов и результатов.
                 if self.enable_memory:
-                    self.history.append({"role": "user", "content": question})
-                    self.history.append({"role": "assistant", "content": final_text})
+                    self.history.append(HumanMessage(question))
+                    self.history.append(AIMessage(final_text))
                 dt_total = time.perf_counter() - t_total_start
                 if self.enable_memory:
                     mem_suffix = f"history → {len(self.history) // 2} пар(ы)"
@@ -721,17 +752,12 @@ class Agent:
                 )
                 return final_text
 
-            # Execute tools and append results
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError as e:
-                    result = {"error": f"invalid JSON arguments: {e}"}
-                    self._trace(f"│  🔧 {self.humanizer.action(name)} ({name})")
-                    self._trace(f"│     ⚠ ошибка парсинга аргументов: {e}")
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": _jdump(result)})
-                    continue
+            # Execute tools and append results.
+            # LangChain отдаёт аргументы тула уже распарсенными в dict.
+            for tc in ai_msg.tool_calls:
+                name = tc["name"]
+                args = tc.get("args") or {}
+                tc_id = tc.get("id")
 
                 self._trace(f"│  🔧 {self.humanizer.action(name)}  →  {name}")
                 for line in self.humanizer.format_args(name, args):
@@ -749,11 +775,7 @@ class Agent:
                 for line in self.humanizer.format_result(name, result):
                     self._trace(f"│     {line}")
                 messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": _jdump(result),
-                    }
+                    ToolMessage(content=_jdump(result), tool_call_id=tc_id)
                 )
 
         return "[превышено максимальное число итераций tool-цикла]"
@@ -782,15 +804,19 @@ class Narrator:
     def __init__(
         self,
         conn: sqlite3.Connection,
-        model: str = DEFAULT_MODEL,
+        model: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        provider: Optional[str] = None,
     ):
-        """reasoning_effort: None отключает параметр (для не-reasoning моделей)."""
-        _ensure_api_key()
+        """provider: 'openai' | 'gigachat' | None (None → из LLM_PROVIDER).
+        reasoning_effort применяется только к reasoning-моделям OpenAI."""
         self.conn = conn
-        self.model = model
+        self.provider = provider or get_provider()
+        self.model = resolve_model(model, self.provider)
         self.reasoning_effort = reasoning_effort
-        self.client = OpenAI()
+        self.llm = make_chat_model(
+            self.model, provider=self.provider, reasoning_effort=reasoning_effort
+        )
         self.emp_names = {
             r["employee_id"]: f"{r['fio']} ({r['post']})"
             for r in conn.execute("SELECT employee_id, fio, post FROM dim_employee").fetchall()
@@ -831,25 +857,18 @@ class Narrator:
             + "\n```"
         )
 
-        kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": NARRATOR_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-        }
-        if self.reasoning_effort:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-
         t_start = time.perf_counter()
-        response = self.client.chat.completions.create(**kwargs)
+        response = self.llm.invoke(
+            [SystemMessage(NARRATOR_SYSTEM), HumanMessage(user_msg)]
+        )
         dt = time.perf_counter() - t_start
-        usage = response.usage
+        usage = response.usage_metadata
         if verbose:
             tu = (
-                f"prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}"
+                f"prompt={usage.get('input_tokens')}, completion={usage.get('output_tokens')}, "
+                f"total={usage.get('total_tokens')}"
                 if usage
                 else "—"
             )
             print(f"  ⏱ narrator LLM call: {Agent._fmt_time(dt)} | tokens: {tu}", flush=True)
-        return response.choices[0].message.content or ""
+        return _text(response.content)

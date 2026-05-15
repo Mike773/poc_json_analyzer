@@ -9,9 +9,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 from src.schema import open_session_db
 from src.ingest import load_json
 from src.pgvector_search import connect, populate_search_cache, get_direction_key, ping
+from src.providers import embedding_dim, get_provider
 
 
 JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "call_center_metrics.json")
@@ -23,6 +28,8 @@ def main() -> None:
         print("Postgres недоступен на DSN по умолчанию.", file=sys.stderr)
         print("Проверьте: docker compose up -d", file=sys.stderr)
         sys.exit(1)
+
+    print(f"Провайдер эмбеддингов: {get_provider()} (размерность вектора={embedding_dim()})")
 
     print("Загружаю JSON в SQLite-сессию…")
     sqlite_conn = open_session_db()
