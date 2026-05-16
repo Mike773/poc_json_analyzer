@@ -4,7 +4,9 @@
 много (config.postgres_min_metrics_per_direction), либо вручную через
 populate_search_cache().
 
-Структура — см. db/init/01_schema.sql.
+Эмбеддинги считаются через LangChain (src/providers.py): провайдер openai или
+gigachat. Размерность вектора зависит от провайдера, поэтому DDL таблицы
+metric_search_cache держим в коде (ensure_schema), а не в db/init/01_schema.sql.
 """
 from __future__ import annotations
 
@@ -12,18 +14,19 @@ import hashlib
 import os
 import re
 import sqlite3
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
-from openai import OpenAI
+from langchain_core.embeddings import Embeddings
+
+from .providers import embedding_dim, make_embeddings
 
 
 DEFAULT_DSN = os.environ.get(
     "POC_PG_DSN",
     "postgresql://poc:poc@localhost:5434/poc_metrics",
 )
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
 
 
 # ---------------------------------------------------------------------------
@@ -64,29 +67,30 @@ def _tokens(name: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Embeddings
+# Embeddings (через LangChain — провайдер из src/providers.py)
 # ---------------------------------------------------------------------------
 
 
-_openai_client: Optional[OpenAI] = None
+_embeddings: Optional[Embeddings] = None
 
 
-def _openai() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY не задан — нужен для embeddings (text-embedding-3-small)"
-            )
-        _openai_client = OpenAI()
-    return _openai_client
+def _emb() -> Embeddings:
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = make_embeddings()
+    return _embeddings
 
 
 def embed_batch(texts: List[str]) -> List[List[float]]:
+    """Эмбеддинги для набора документов (имён метрик)."""
     if not texts:
         return []
-    resp = _openai().embeddings.create(model=EMBED_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
+    return _emb().embed_documents(list(texts))
+
+
+def embed_query(text: str) -> List[float]:
+    """Эмбеддинг одного поискового запроса."""
+    return _emb().embed_query(text)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +103,69 @@ def _format_vector(v: List[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
 
 
+def _existing_vector_dim(cur: psycopg.Cursor) -> Optional[int]:
+    """Размерность колонки vector в metric_search_cache; None — если таблицы нет."""
+    cur.execute("SELECT to_regclass('metric_search_cache')")
+    if cur.fetchone()[0] is None:
+        return None
+    # Для типа vector pgvector хранит размерность напрямую в atttypmod.
+    cur.execute(
+        """SELECT atttypmod FROM pg_attribute
+           WHERE attrelid = 'metric_search_cache'::regclass AND attname = 'vector'"""
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None or row[0] < 0:
+        return None
+    return int(row[0])
+
+
+def ensure_schema(pg_conn: psycopg.Connection) -> None:
+    """Создаёт metric_search_cache с размерностью вектора под активный провайдер.
+
+    Если таблица уже есть, но с другой размерностью (сменили провайдер эмбеддингов) —
+    пересоздаёт её: это кеш, он полностью восстанавливается populate_search_cache().
+    """
+    dim = embedding_dim()
+    with pg_conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        existing = _existing_vector_dim(cur)
+        if existing is not None and existing != dim:
+            print(
+                f"metric_search_cache: размерность вектора {existing} ≠ {dim} "
+                f"(сменился провайдер эмбеддингов) — пересоздаю кеш.",
+                file=sys.stderr,
+            )
+            cur.execute("DROP TABLE metric_search_cache")
+            existing = None
+        if existing is None:
+            cur.execute(
+                f"""CREATE TABLE IF NOT EXISTS metric_search_cache (
+                       direction_key text NOT NULL,
+                       metric_id     bigint NOT NULL,
+                       name          text NOT NULL,
+                       name_hash     text NOT NULL,
+                       abbreviations text[] DEFAULT '{{}}',
+                       vector        vector({dim}),
+                       created_at    timestamptz NOT NULL DEFAULT now(),
+                       updated_at    timestamptz NOT NULL DEFAULT now(),
+                       PRIMARY KEY (direction_key, metric_id)
+                   )"""
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metric_search_cache_vector "
+                "ON metric_search_cache USING hnsw (vector vector_cosine_ops)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metric_search_cache_abbr "
+                "ON metric_search_cache USING gin (abbreviations)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metric_search_cache_direction "
+                "ON metric_search_cache (direction_key)"
+            )
+    pg_conn.commit()
+
+
 def populate_search_cache(
     sqlite_conn: sqlite3.Connection,
     pg_conn: psycopg.Connection,
@@ -108,6 +175,8 @@ def populate_search_cache(
 
     direction_key: если None — берётся department у любого сотрудника в данной сессии.
     """
+    ensure_schema(pg_conn)
+
     # direction_key
     if direction_key is None:
         row = sqlite_conn.execute(
@@ -179,7 +248,7 @@ def search_metrics_pgvector(
         return []
 
     tokens = _tokens(q)
-    query_vec = embed_batch([q])[0]
+    query_vec = embed_query(q)
     qvec_str = _format_vector(query_vec)
 
     with pg_conn.cursor() as cur:

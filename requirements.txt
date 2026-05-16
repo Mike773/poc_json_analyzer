@@ -1,4 +1,7 @@
 numpy>=1.26
 scipy>=1.11
-openai>=1.55
 psycopg[binary]>=3.2
+python-dotenv>=1.0
+langchain-core>=0.3
+langchain-openai>=0.3
+langchain-gigachat>=0.3

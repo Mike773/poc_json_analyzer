@@ -15,6 +15,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
 from src.schema import open_session_db
 from src.ingest import load_json
 from src.peers import build_peer_groups
@@ -47,12 +51,20 @@ def main():
     parser.add_argument("--employee", help="ограничить одним сотрудником (employee_id)")
     parser.add_argument("--top", type=int, default=8, help="макс. инсайтов на сотрудника")
     parser.add_argument(
+        "--provider",
+        default=os.environ.get("LLM_PROVIDER", "openai"),
+        choices=["openai", "gigachat"],
+        help="провайдер LLM (по умолчанию из LLM_PROVIDER или openai)",
+    )
+    parser.add_argument(
         "--effort",
         default="none",
         choices=["none", "low", "medium", "high"],
-        help="reasoning_effort для o-series; 'none' — не передавать параметр",
+        help="reasoning_effort для reasoning-моделей OpenAI; 'none' — не передавать",
     )
-    parser.add_argument("--model", default="o4-mini")
+    parser.add_argument(
+        "--model", default=None, help="имя модели (по умолчанию — дефолтная модель провайдера)"
+    )
     args = parser.parse_args()
     effort = None if args.effort == "none" else args.effort
 
@@ -68,9 +80,14 @@ def main():
 
     if args.employee:
         insights = [i for i in insights if i.employee_id == args.employee]
-    print(f"Инсайтов: {len(insights)}. Запрос к {args.model}…", flush=True)
 
-    narrator = Narrator(conn, model=args.model, reasoning_effort=effort)
+    narrator = Narrator(
+        conn, model=args.model, provider=args.provider, reasoning_effort=effort
+    )
+    print(
+        f"Инсайтов: {len(insights)}. Запрос к {narrator.provider}/{narrator.model}…",
+        flush=True,
+    )
     t_llm = time.perf_counter()
     report = narrator.narrate(insights, top_per_employee=args.top, verbose=True)
     print(f"  итог narrator: {_fmt(time.perf_counter() - t_llm)}\n", flush=True)

@@ -21,6 +21,7 @@ env/
 # Secrets / local config
 .env
 .env.*
+!.env.example
 *.local
 
 # Local data / artifacts
